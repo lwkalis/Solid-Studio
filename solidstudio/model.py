@@ -101,19 +101,122 @@ def sketch_path(profile):
 
 
 def closest_profile(profiles, point, tolerance):
+    hit = closest_sketch_edge(profiles, point, tolerance)
+    return hit[0] if hit is not None else None
+
+
+def closest_sketch_edge(profiles, point, tolerance, dimensionable=False):
     best = None
     for index, profile in enumerate(profiles):
         if profile.get("deleted"):
             continue
+        kind = profile["type"]
+        if dimensionable and kind not in {"rectangle", "polyline", "polygon", "circle"}:
+            continue
         path = sketch_path(profile)
-        for a, b in zip(path, path[1:]):
+        for edge, (a, b) in enumerate(zip(path, path[1:])):
             dx, dy = b[0] - a[0], b[1] - a[1]
             length = dx * dx + dy * dy
             t = max(0, min(1, ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / length)) if length else 0
             distance = math.dist(point, (a[0] + t * dx, a[1] + t * dy))
             if distance <= tolerance and (best is None or distance <= best[0]):
-                best = distance, index
-    return best[1] if best is not None else None
+                best = distance, index, edge
+    return best[1:] if best is not None else None
+
+
+def dimension_key(profile, edge):
+    if profile["type"] == "circle":
+        return "diameter"
+    if profile["type"] == "rectangle":
+        return str(edge % 2)
+    return str(edge)
+
+
+def dimension_segment(profile, edge):
+    if profile["type"] == "circle":
+        center, rim = profile["points"]
+        radius = math.dist(center, rim)
+        return ([center[0] - radius, center[1]], [center[0] + radius, center[1]])
+    path = sketch_path(profile)
+    return path[edge], path[edge + 1]
+
+
+def sketch_edit_is_valid(original, candidate, changed_dimension=None):
+    for index, (before, after) in enumerate(zip(original, candidate)):
+        if before["points"] == after["points"]:
+            continue
+        if before.get("fixed"):
+            return False
+        points = after["points"]
+        if after["type"] == "rectangle" and any(
+            abs(a - b) < 1e-7 for a, b in zip(*points)
+        ):
+            return False
+        if after["type"] in {"polyline", "polygon"}:
+            path = sketch_path(after)
+            if any(math.dist(a, b) < 1e-7 for a, b in zip(path, path[1:])):
+                return False
+        if after["type"] == "open_arc" and arc_geometry(points) is None:
+            return False
+        if after.get("rule") and len(points) == 2:
+            axis = 1 if after["rule"] == "Horizontal" else 0
+            if not math.isclose(points[0][axis], points[1][axis], abs_tol=1e-7):
+                return False
+        for key, dimension in before.get("dimensions", {}).items():
+            if (index, key) == changed_dimension:
+                continue
+            if not math.isclose(math.dist(*dimension_segment(after, dimension["edge"])),
+                                dimension["value"], rel_tol=1e-8, abs_tol=1e-7):
+                return False
+    return True
+
+
+def move_sketch_points(original, candidate, index, positions):
+    points = original[index]["points"]
+    replacements = {tuple(points[i]): value for i, value in positions.items()}
+    for i, (before, after) in enumerate(zip(original, candidate)):
+        if before.get("deleted") or (i != index and before["type"] not in {"polyline", "polygon", "open_arc"}):
+            continue
+        after["points"] = [
+            list(positions.get(j, point) if i == index else replacements.get(tuple(point), point))
+            for j, point in enumerate(before["points"])
+        ]
+
+
+def move_sketch_segment(original, candidate, index, edge, delta):
+    profile = original[index]
+    points = profile["points"]
+    if profile["type"] == "rectangle":
+        axis = 1 if edge % 2 == 0 else 0
+        corner = 0 if edge in (0, 3) else 1
+        position = points[corner][:]
+        position[axis] += delta[axis]
+        positions = {corner: position}
+    else:
+        positions = {i: [a + b for a, b in zip(points[i], delta)]
+                     for i in (edge, (edge + 1) % len(points))}
+    move_sketch_points(original, candidate, index, positions)
+
+
+def resize_sketch_dimension(original, candidate, index, edge, value):
+    profile = original[index]
+    points = profile["points"]
+    a, b = dimension_segment(profile, edge)
+    length = math.dist(a, b)
+    if length < 1e-7:
+        return False
+    if profile["type"] == "rectangle":
+        axis = edge % 2
+        position = points[1][:]
+        position[axis] = points[0][axis] + math.copysign(value, position[axis] - points[0][axis])
+        positions = {1: position}
+    elif profile["type"] == "circle":
+        center, rim = points
+        positions = {1: [x + (y - x) * value / length for x, y in zip(center, rim)]}
+    else:
+        positions = {(edge + 1) % len(points): [x + (y - x) * value / length for x, y in zip(a, b)]}
+    move_sketch_points(original, candidate, index, positions)
+    return sketch_edit_is_valid(original, candidate, (index, dimension_key(profile, edge)))
 
 
 def line_intersection(a, b, c, d):
@@ -130,6 +233,8 @@ def trim_line(profiles, index, pick):
     profile = profiles[index]
     if profile["type"] != "polyline" or len(profile["points"]) != 2:
         raise ValueError("Trim currently works on individual straight lines.")
+    if profile.get("fixed") or profile.get("dimensions"):
+        raise ValueError("Remove the line's fixed or length constraint before trimming.")
     a, b = profile["points"]
     dx, dy = b[0] - a[0], b[1] - a[1]
     length = dx * dx + dy * dy

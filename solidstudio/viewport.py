@@ -1,6 +1,7 @@
 """Orthographic viewport, sketch input, and visible-body picking."""
 
 import math
+from copy import deepcopy
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF, QLinearGradient
@@ -42,6 +43,7 @@ class Viewport(QWidget):
     sketch_changed = Signal()
     face_selected = Signal(object)
     sketch_notice = Signal(str)
+    dimension_requested = Signal(int, int, object)
 
     def __init__(self):
         super().__init__()
@@ -69,6 +71,10 @@ class Viewport(QWidget):
         self.pick_face = False
         self.face_meshes = {}
         self.sketch_selection = None
+        self.sketch_edge = None
+        self.sketch_drag = None
+        self.pending_dimension = None
+        self.dimension_labels = []
         self.snap = True
 
     def axes(self):
@@ -84,10 +90,10 @@ class Viewport(QWidget):
         return QPointF(self.width() / 2 + self.offset.x() + dot(relative, right) * self.scale,
                        self.height() / 2 + self.offset.y() - dot(relative, up) * self.scale), dot(relative, depth)
 
-    def sketch_point(self, point):
+    def sketch_point(self, point, snap=True):
         coords = [(point.x() - self.width() / 2 - self.offset.x()) / self.scale,
                   (self.height() / 2 + self.offset.y() - point.y()) / self.scale]
-        return [round(value) if self.snap else round(value, 4) for value in coords]
+        return [round(value) if snap and self.snap else value for value in coords]
 
     def sketch_screen(self, point):
         return QPointF(self.width() / 2 + self.offset.x() + point[0] * self.scale,
@@ -150,12 +156,16 @@ class Viewport(QWidget):
         self.points = []
         self.hover = None
         self.sketch_selection = None
+        self.sketch_edge = self.sketch_drag = self.pending_dimension = None
+        self.dimension_labels.clear()
         self.navigation = ""
         self.fit()
 
     def choose_tool(self, name):
+        self.cancel_sketch_drag()
         self.finish_chain()
         self.tool, self.points = name, []
+        self.pending_dimension = None
         self.setFocus()
         self.update()
 
@@ -167,12 +177,49 @@ class Viewport(QWidget):
             if index is not None:
                 self.draft["profiles"][index]["deleted"] = True
             self.sketch_selection = None
+            self.sketch_edge = None
         self.sketch_changed.emit()
         self.update()
 
     def select_profile(self, index):
         self.sketch_selection = index
+        self.sketch_edge = None
         self.update()
+
+    def cancel_sketch_drag(self):
+        if self.sketch_drag:
+            self.draft["profiles"] = self.sketch_drag[3]
+            self.sketch_drag = None
+
+    def move_sketch_drag(self, pos):
+        index, edge, start, original, vertex = self.sketch_drag
+        delta = [(b - a) / self.scale for a, b in zip((start.x(), -start.y()), (pos.x(), -pos.y()))]
+        if (pos - start).manhattanLength() < 3:
+            self.draft["profiles"] = original
+            return
+        if self.snap:
+            delta = list(map(round, delta))
+        candidate = deepcopy(original)
+        if vertex is None:
+            model.move_sketch_segment(original, candidate, index, edge, delta)
+        else:
+            profile = original[index]
+            point = profile["points"][vertex]
+            rule = profile.get("rule")
+            if rule:
+                delta[1 if rule == "Horizontal" else 0] = 0
+            position = [a + b for a, b in zip(point, delta)]
+            if profile["type"] == "polyline" and len(profile["points"]) == 2:
+                dimension = profile.get("dimensions", {}).get("0")
+                if dimension and not rule:
+                    anchor = profile["points"][1 - vertex]
+                    distance = math.dist(position, anchor)
+                    if distance < 1e-7:
+                        return
+                    position = [a + (b - a) * dimension["value"] / distance for a, b in zip(anchor, position)]
+            model.move_sketch_points(original, candidate, index, {vertex: position})
+        if model.sketch_edit_is_valid(original, candidate):
+            self.draft["profiles"] = candidate
 
     def finish_chain(self):
         if self.draft and self.tool == "Line" and len(self.points) >= 2:
@@ -184,6 +231,7 @@ class Viewport(QWidget):
     def add_profile(self, kind, points):
         self.draft["profiles"].append({"type": kind, "points": points})
         self.sketch_selection = len(self.draft["profiles"]) - 1
+        self.sketch_edge = None
         self.sketch_changed.emit()
 
     def pick_planar_face(self, pos):
@@ -310,7 +358,7 @@ class Viewport(QWidget):
                 return
             path = QPolygonF([self.sketch_screen(point) for point in points])
             dashed = preview or profile.get("construction")
-            color = "#df8b3b" if selected else "#76a4bb" if dashed else "#2b78a5"
+            color = "#df8b3b" if selected else "#518351" if profile.get("fixed") else "#76a4bb" if dashed else "#2b78a5"
             p.setPen(QPen(QColor(color), 2 if selected else 1.6,
                           Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine))
             if not dashed and points[0] == points[-1]:
@@ -324,13 +372,52 @@ class Viewport(QWidget):
 
         for index, profile in enumerate(self.draft["profiles"]):
             if not profile.get("deleted"):
-                shape(profile, selected=index == self.sketch_selection)
+                shape(profile, selected=index == self.sketch_selection and self.sketch_edge is None)
+                if index == self.sketch_selection and self.sketch_edge is not None:
+                    a, b = model.dimension_segment(profile, self.sketch_edge)
+                    p.setPen(QPen(QColor("#df8b3b"), 2.5))
+                    p.drawLine(self.sketch_screen(a), self.sketch_screen(b))
+        self.draw_dimensions(p)
         if self.points and self.hover is not None:
             kind = {"Line": "polyline", "Rectangle": "rectangle", "Circle": "circle", "Arc": "open_arc"}[self.tool]
             points = self.points + [self.hover]
             if self.tool == "Arc" and len(points) == 3:
                 points = [points[0], points[2], points[1]]
             shape({"type": kind, "points": points}, True)
+
+    def draw_dimensions(self, painter):
+        self.dimension_labels.clear()
+        for index, profile in enumerate(self.draft["profiles"]):
+            if profile.get("deleted"):
+                continue
+            for dimension in profile.get("dimensions", {}).values():
+                rect = self.draw_dimension(painter, profile, dimension["edge"], dimension["label"])
+                self.dimension_labels.append((rect, index, dimension))
+        if self.pending_dimension is not None and self.hover is not None:
+            index, edge = self.pending_dimension
+            self.draw_dimension(painter, self.draft["profiles"][index], edge, self.hover)
+
+    def draw_dimension(self, painter, profile, edge, label):
+        a, b = map(self.sketch_screen, model.dimension_segment(profile, edge))
+        label = self.sketch_screen(label)
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        length = math.hypot(dx, dy)
+        normal = QPointF(-dy / length, dx / length) if length else QPointF(0, 1)
+        offset = normal * dot((label.x() - a.x(), label.y() - a.y()), (normal.x(), normal.y()))
+        painter.setPen(QPen(QColor("#334d65"), 1))
+        painter.drawLine(a, a + offset)
+        painter.drawLine(b, b + offset)
+        painter.drawLine(a + offset, b + offset)
+        painter.drawLine(a + offset - normal * 4, a + offset + normal * 4)
+        painter.drawLine(b + offset - normal * 4, b + offset + normal * 4)
+        value = length / self.scale
+        prefix = "⌀ " if profile["type"] == "circle" else ""
+        text = f"{prefix}{value:.3f}".rstrip("0").rstrip(".")
+        width = painter.fontMetrics().horizontalAdvance(text) + 10
+        rect = QRectF(label.x() - width / 2, label.y() - 9, width, 18)
+        painter.fillRect(rect, QColor("#f8fafc"))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        return rect
 
     def cube_polygons(self):
         x = self.width() - 82
@@ -378,9 +465,24 @@ class Viewport(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         if self.draft is not None:
+            if self.tool == "Dimension":
+                self.pick_dimension(pos)
+                return
             point = self.sketch_point(pos) if self.tool in {"Select", "Trim"} else self.draw_point(pos)
             if self.tool in {"Select", "Trim"}:
-                self.sketch_selection = model.closest_profile(self.draft["profiles"], point, 9 / self.scale + 0.8)
+                self.sketch_edge = None
+                hit = model.closest_sketch_edge(self.draft["profiles"], self.sketch_point(pos, False), 9 / self.scale)
+                self.sketch_selection = hit[0] if hit else None
+                if self.tool == "Select" and hit:
+                    index, edge = hit
+                    profiles = self.draft["profiles"]
+                    profile = profiles[index]
+                    if profile["type"] in {"rectangle", "polyline", "polygon"}:
+                        self.sketch_edge = edge
+                        vertices = profile["points"]
+                        vertex = next((i for i, v in enumerate(vertices)
+                                       if (self.sketch_screen(v) - pos).manhattanLength() <= 7), None)
+                        self.sketch_drag = index, edge, pos, deepcopy(profiles), vertex
                 if self.tool == "Trim" and self.sketch_selection is not None:
                     try:
                         model.trim_line(self.draft["profiles"], self.sketch_selection, point)
@@ -426,6 +528,8 @@ class Viewport(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.position()
+        if self.sketch_drag:
+            self.move_sketch_drag(pos)
         if self.drag:
             previous, mode = self.drag
             delta = pos - previous
@@ -438,12 +542,45 @@ class Viewport(QWidget):
                 self.offset += delta
             self.drag = pos, mode
         if self.draft is not None:
-            self.hover = self.sketch_point(pos) if self.tool in {"Select", "Trim"} else self.draw_point(pos)
-            self.coordinates.emit(f"X {self.hover[0]} mm   Y {self.hover[1]} mm")
+            self.hover = self.sketch_point(pos, False) if self.tool in {"Select", "Trim", "Dimension"} else self.draw_point(pos)
+            self.coordinates.emit(f"X {self.hover[0]:.3g} mm   Y {self.hover[1]:.3g} mm")
         self.update()
 
     def mouseReleaseEvent(self, event):
         self.drag = None
+        if self.sketch_drag and event.button() == Qt.MouseButton.LeftButton:
+            self.move_sketch_drag(event.position())
+            self.sketch_drag = None
+            self.sketch_changed.emit()
+            self.update()
+
+    def pick_dimension(self, pos):
+        point = self.sketch_point(pos, False)
+        if self.pending_dimension is not None:
+            index, edge = self.pending_dimension
+            self.pending_dimension = None
+            self.dimension_requested.emit(index, edge, point)
+            self.sketch_notice.emit("Select a sketch line or circle to dimension.")
+        else:
+            hit = model.closest_sketch_edge(self.draft["profiles"], point, 9 / self.scale, dimensionable=True)
+            if hit is None:
+                return
+            self.sketch_selection, self.sketch_edge = hit
+            if self.draft["profiles"][hit[0]]["type"] == "circle":
+                self.sketch_edge = None
+            self.pending_dimension = hit
+            self.hover = point
+            self.sketch_notice.emit("Click where you want to place the dimension.")
+        self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if self.draft is not None and event.button() == Qt.MouseButton.LeftButton and self.tool == "Select":
+            for rect, index, dimension in reversed(self.dimension_labels):
+                if rect.contains(event.position()):
+                    self.cancel_sketch_drag()
+                    self.dimension_requested.emit(index, dimension["edge"], dimension["label"])
+                    return
+        super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event):
         before = self.scale

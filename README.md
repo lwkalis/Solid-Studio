@@ -41,7 +41,7 @@ sudo apt install libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
 ## Try the workflow
 
 1. Open `examples/mounting-plate.solidstudio` with **File → Open**.
-2. Double-click **Sketch 1** in the timeline, select the rectangle in the viewport, press **D**, and increase its width. Click **Finish Sketch** to recompute the two cuts and the fillet.
+2. Double-click **Sketch 1** in the timeline. Press **D**, click a horizontal rectangle edge, and click where the dimension should appear. Enter a larger width and click **Finish Sketch** to recompute the two cuts and the fillet.
 3. Right-click a timeline item to roll before or after it. Use the end button to return to the completed model.
 4. Save your edited copy in `.solidstudio` format. Export STEP to use the finished solid in another CAD tool.
 
@@ -53,6 +53,9 @@ For a fresh design, choose **Create Sketch**, then select XY, XZ, or YZ or click
 | Standard views and fit | Click the view cube or press Home to fit |
 | Toolbox | S |
 | Sketch line, rectangle, circle, dimension | L, R, C, D |
+| Move sketch geometry | Drag a line segment or its endpoint in **Sketch Select** |
+| Edit an existing dimension | Double-click its value in **Sketch Select** |
+| Lock or unlock a profile | Select it and click **Fix / UnFix** |
 | Sketch Trim, Offset, Project | T, O, P |
 | Toggle construction geometry | X |
 | Extrude / fillet | E / F |

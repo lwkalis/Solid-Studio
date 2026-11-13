@@ -1,11 +1,12 @@
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from solidstudio import model
 
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QDoubleSpinBox
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QDoubleSpinBox, QInputDialog
 
 from solidstudio.ui import STYLE, Studio
 
@@ -100,3 +101,63 @@ class WorkspaceTests(unittest.TestCase):
         window.redo()
         window.redo()
         self.assertTrue(window.draft["profiles"][0]["construction"])
+
+    def test_drag_and_dimension_individual_rectangle_edges(self):
+        window = self.window
+        window.start_on_plane("XY")
+        viewport = window.viewport
+        viewport.add_profile("rectangle", [[-10, -10], [10, 10]])
+        self.application.processEvents()
+
+        def point(x, y):
+            return viewport.sketch_screen((x, y)).toPoint()
+
+        def drag(start, end):
+            QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=point(*start))
+            QTest.mouseMove(viewport, point(*end))
+            QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=point(*end))
+
+        drag((0, 10), (0, 14))
+        self.assertEqual(window.draft["profiles"][0]["points"], [[-10, -10], [10, 14]])
+        window.undo()
+        self.assertEqual(window.draft["profiles"][0]["points"], [[-10, -10], [10, 10]])
+        QTest.keyClick(viewport, Qt.Key.Key_D)
+        with patch.object(QInputDialog, "getDouble", return_value=(30, True)) as editor:
+            QTest.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=point(0, 10))
+            editor.assert_not_called()
+            QTest.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=point(0, 20))
+            editor.assert_called_once()
+        QTest.keyClick(viewport, Qt.Key.Key_Escape)
+        self.assertEqual(window.draft["profiles"][0]["points"], [[-10, -10], [20, 10]])
+        drag((20, 0), (25, 0))
+        self.assertEqual(window.draft["profiles"][0]["points"][1], [20, 10])
+        drag((0, 10), (0, 14))
+        self.assertEqual(window.draft["profiles"][0]["points"][1], [20, 14])
+        self.application.processEvents()
+        label = viewport.dimension_labels[0][0].center().toPoint()
+        with patch.object(QInputDialog, "getDouble", return_value=(26, True)):
+            QTest.mouseDClick(viewport, Qt.MouseButton.LeftButton, pos=label)
+        self.assertEqual(window.draft["profiles"][0]["points"][1], [16, 14])
+
+    def test_drag_preserves_connected_endpoints_and_fixed_geometry(self):
+        window = self.window
+        window.start_on_plane("XY")
+        viewport = window.viewport
+        viewport.add_profile("polyline", [[-10, 0], [0, 0]])
+        viewport.add_profile("polyline", [[0, 0], [0, 10]])
+        self.application.processEvents()
+
+        def drag(start, end):
+            a = viewport.sketch_screen(start).toPoint()
+            b = viewport.sketch_screen(end).toPoint()
+            QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=a)
+            QTest.mouseMove(viewport, b)
+            QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=b)
+
+        drag((-5, 0), (-5, 4))
+        profiles = window.draft["profiles"]
+        self.assertEqual(profiles[0]["points"], [[-10, 4], [0, 4]])
+        self.assertEqual(profiles[1]["points"], [[0, 4], [0, 10]])
+        window.fix_sketch_geometry()
+        drag((0, 7), (4, 7))
+        self.assertEqual(window.draft["profiles"][1]["points"], [[0, 4], [0, 10]])

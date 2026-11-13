@@ -197,7 +197,8 @@ class Studio(QMainWindow):
                                    ("Trim", lambda: self.viewport.choose_tool("Trim"), "Trim"),
                                    ("Delete", lambda: self.viewport.remove_profile(), "Undo")])
         self.group(row, "CONSTRAIN", [("Dimension", self.dimensions, "Sketch"),
-                                      ("Horizontal / Vertical", self.line_rule, "Line")])
+                                      ("Horizontal / Vertical", self.line_rule, "Line"),
+                                      ("Fix / UnFix", self.fix_sketch_geometry, "Select")])
         self.group(row, "PROJECT", [("Project", self.project_geometry, "Project")])
         self.group(row, "SELECT", [("Sketch Select", lambda: self.viewport.choose_tool("Select"), "Select")])
         row.addStretch()
@@ -224,6 +225,7 @@ class Studio(QMainWindow):
         self.viewport.body_selected.connect(self.select)
         self.viewport.face_selected.connect(self.use_sketch_face)
         self.viewport.sketch_notice.connect(lambda text: self.statusBar().showMessage(text))
+        self.viewport.dimension_requested.connect(self.edit_sketch_dimension)
         self.viewport.coordinates.connect(lambda value: self.coords.setText(value))
         self.viewport.sketch_changed.connect(self.update_palette)
         center.addWidget(self.viewport, 1)
@@ -609,9 +611,27 @@ class Studio(QMainWindow):
             return
         value, ok = QInputDialog.getItem(self, "Sketch Constraint", "Direction", ["Horizontal", "Vertical"], editable=False)
         if ok:
-            model.apply_line_rule(profile, value)
+            profiles = self.draft["profiles"]
+            index = next(i for i, item in enumerate(profiles) if item is profile)
+            updated = deepcopy(profiles)
+            aligned = deepcopy(profile)
+            model.apply_line_rule(aligned, value)
+            model.move_sketch_points(profiles, updated, index, {1: aligned["points"][1]})
+            updated[index]["rule"] = value
+            if not model.sketch_edit_is_valid(profiles, updated):
+                self.statusBar().showMessage("This direction conflicts with existing sketch constraints.")
+                return
+            self.draft["profiles"] = updated
             self.update_palette()
             self.viewport.update()
+
+    def fix_sketch_geometry(self):
+        if not self.draft or self.viewport.sketch_selection is None:
+            return
+        profile = self.draft["profiles"][self.viewport.sketch_selection]
+        profile["fixed"] = not profile.get("fixed", False)
+        self.update_palette()
+        self.viewport.update()
 
     def project_geometry(self):
         if not self.draft:
@@ -659,36 +679,26 @@ class Studio(QMainWindow):
             self.statusBar().showMessage("The offset would collapse the profile.")
 
     def dimensions(self):
-        profile = self.selected_profile()
-        if profile is None:
-            self.statusBar().showMessage("Draw or select sketch geometry first.")
+        if not self.draft:
             return
-        points = profile["points"]
-        if profile["type"] == "circle":
-            value, ok = QInputDialog.getDouble(self, "Sketch Dimension", "Diameter (mm)", 2 * math.dist(*points), 0.01, 100000, 2)
-            if ok:
-                points[1] = [points[0][0] + value / 2, points[0][1]]
-        elif profile["type"] == "rectangle":
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Sketch Dimensions")
-            form = QFormLayout(dialog)
-            width = self.number(form, "Width (mm)", abs(points[1][0] - points[0][0]), 0.01)
-            height = self.number(form, "Height (mm)", abs(points[1][1] - points[0][1]), 0.01)
-            self.buttons(dialog, form)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                points[1] = [points[0][0] + width.value() * (1 if points[1][0] >= points[0][0] else -1),
-                             points[0][1] + height.value() * (1 if points[1][1] >= points[0][1] else -1)]
-        elif profile["type"] == "polyline" and len(points) == 2:
-            length = math.dist(*points)
-            value, ok = QInputDialog.getDouble(self, "Sketch Dimension", "Length (mm)", length, 0.01, 100000, 3)
-            if ok:
-                if profile.get("rule"):
-                    model.apply_line_rule(profile, profile["rule"], value)
-                else:
-                    a, b = points
-                    points[1] = [x + (y - x) * value / length for x, y in zip(a, b)]
-        else:
-            self.statusBar().showMessage("Dimensions are available for circles, rectangles, and individual lines.")
+        self.viewport.choose_tool("Dimension")
+        self.statusBar().showMessage("Select a sketch line or circle to dimension.")
+
+    def edit_sketch_dimension(self, index, edge, label_position):
+        profiles = self.draft["profiles"]
+        profile = profiles[index]
+        key = model.dimension_key(profile, edge)
+        title = "Diameter (mm)" if profile["type"] == "circle" else "Length (mm)"
+        current = math.dist(*model.dimension_segment(profile, edge))
+        value, ok = QInputDialog.getDouble(self, "Sketch Dimension", title, current, 0.001, 100000, 6)
+        if not ok:
+            return
+        updated = deepcopy(profiles)
+        if not model.resize_sketch_dimension(profiles, updated, index, edge, value):
+            QMessageBox.warning(self, "Sketch Dimension", "This value conflicts with existing sketch constraints.")
+            return
+        updated[index].setdefault("dimensions", {})[key] = {"edge": edge, "value": value, "label": label_position}
+        self.draft["profiles"] = updated
         self.update_palette()
         self.viewport.update()
 

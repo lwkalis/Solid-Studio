@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "features": [
+    {
+      "id": "plate-profile",
+      "name": "Sketch 1",
+      "kind": "Sketch",
+      "plane": "XY",
+      "profiles": [{"type": "rectangle", "points": [[-30, -18], [30, 18]]}]
+    },
+    {
+      "id": "plate",
+      "name": "Extrude 1",
+      "kind": "Extrude",
+      "sketch": "plate-profile",
+      "profile": 0,
+      "distance": 10,
+      "operation": "New Body"
+    },
+    {
+      "id": "hole-profiles",
+      "name": "Sketch 2",
+      "kind": "Sketch",
+      "plane": "XY",
+      "profiles": [
+        {"type": "circle", "points": [[-17, 0], [-13, 0]]},
+        {"type": "circle", "points": [[17, 0], [21, 0]]}
+      ]
+    },
+    {
+      "id": "left-hole",
+      "name": "Extrude 2",
+      "kind": "Extrude",
+      "sketch": "hole-profiles",
+      "profile": 0,
+      "distance": 10,
+      "operation": "Cut",
+      "target": "plate"
+    },
+    {
+      "id": "right-hole",
+      "name": "Extrude 3",
+      "kind": "Extrude",
+      "sketch": "hole-profiles",
+      "profile": 1,
+      "distance": 10,
+      "operation": "Cut",
+      "target": "plate"
+    },
+    {
+      "id": "round-top",
+      "name": "Fillet 1",
+      "kind": "Fillet",
+      "target": "plate",
+      "edges": "Top edges",
+      "size": 1
+    }
+  ]
+}
